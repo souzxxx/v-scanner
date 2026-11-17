@@ -32,8 +32,11 @@ import (
 
 const toolName = "angela"
 
-// now is replaced in tests to get a deterministic generated_at
-var now = time.Now
+// now and scanVulns are replaced in tests (deterministic, no network)
+var (
+	now       = time.Now
+	scanVulns = scanForVulns
+)
 
 // scanTarget is a parsed dependency file ready to be scanned
 type scanTarget struct {
@@ -69,7 +72,7 @@ func collectScan(
 	ctx context.Context,
 	target scanTarget,
 ) scanOutcome {
-	vulns, err := scanForVulns(ctx, target.Deps)
+	vulns, err := scanVulns(ctx, target.Deps)
 	vulns = filterIgnoredVulns(vulns, target.Cfg.IgnoreVulns)
 	vulns = filterVulnsBySeverity(
 		vulns, resolveMinSeverity(target.Cfg.MinSeverity),
@@ -103,7 +106,7 @@ func countVulns(vulns map[string][]types.Vulnerability) int {
 // Packages are sorted by name and each package's vulnerabilities by
 // severity, so the output is stable between runs.
 func buildReport(
-	command, file string, //nolint:unparam // check/update join in LN2
+	command, file string,
 	res types.ScanResult,
 	versions map[string]string,
 	errs ...error,

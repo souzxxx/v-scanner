@@ -68,6 +68,17 @@ func defaultCacheDir() string {
 
 // Execute sets up the CLI and runs the root command
 func Execute() {
+	if err := newRootCmd().Execute(); err != nil {
+		if jsonMode() {
+			printJSONError(err.Error())
+		} else {
+			PrintError(err.Error())
+		}
+		os.Exit(1)
+	}
+}
+
+func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "angela",
 		Short: "Python dependency updater and vulnerability scanner",
@@ -78,7 +89,9 @@ latest stable versions, and checks for known CVEs using OSV.dev.`,
 		PersistentPreRun: func(
 			_ *cobra.Command, _ []string,
 		) {
-			ui.PrintBanner()
+			if !jsonMode() {
+				ui.PrintBanner()
+			}
 		},
 	}
 
@@ -110,11 +123,7 @@ latest stable versions, and checks for known CVEs using OSV.dev.`,
 		newScanCmd(),
 		newCacheCmd(),
 	)
-
-	if err := root.Execute(); err != nil {
-		PrintError(err.Error())
-		os.Exit(1)
-	}
+	return root
 }
 
 const pyprojectTemplate = `[project]
@@ -204,6 +213,7 @@ func newUpdateCmd() *cobra.Command {
 		&f.includePrerelease, "include-prerelease", false,
 		"include pre-release versions",
 	)
+	addJSONFlags(cmd)
 	return cmd
 }
 
@@ -237,6 +247,7 @@ func newCheckCmd() *cobra.Command {
 		&f.includePrerelease, "include-prerelease", false,
 		"include pre-release versions",
 	)
+	addJSONFlags(cmd)
 	return cmd
 }
 
@@ -258,6 +269,7 @@ func newScanCmd() *cobra.Command {
 		&file, "file", "f", "pyproject.toml",
 		"path to dependency file",
 	)
+	addJSONFlags(cmd)
 	return cmd
 }
 
@@ -303,14 +315,13 @@ func runUpdate(
 	}
 	cfg, deps := target.Cfg, target.Deps
 
-	spin := ui.NewSpinner(fmt.Sprintf(
+	stopSpinner := startSpinner(fmt.Sprintf(
 		"Scanning %d dependencies...", len(deps),
 	))
-	spin.Start()
 
 	client, err := pypi.NewClient(defaultCacheDir())
 	if err != nil {
-		spin.Stop()
+		stopSpinner()
 		return err
 	}
 
@@ -339,13 +350,14 @@ func runUpdate(
 		out = collectScan(ctx, target)
 	}
 
-	spin.Stop()
+	stopSpinner()
 
-	if out.Err != nil {
+	if out.Err != nil && !jsonMode() {
 		PrintError(out.Err.Error())
 	}
 
-	if !dryRun && len(updateSpecs) > 0 {
+	updated := !dryRun && len(updateSpecs) > 0
+	if updated {
 		if err := updateDepsFile(
 			f.file, updateSpecs,
 		); err != nil {
@@ -353,12 +365,7 @@ func runUpdate(
 		}
 	}
 
-	PrintVulnerabilities(out.Vulns)
-
-	PrintUpdates(updates)
-	PrintSkipped(updates)
-
-	PrintSummary(types.ScanResult{
+	res := types.ScanResult{
 		Updates:         updates,
 		Vulnerabilities: out.Vulns,
 		TotalPackages:   len(deps),
@@ -366,7 +373,22 @@ func runUpdate(
 		TotalVulns:      countVulns(out.Vulns),
 		VulnsScanned:    f.vulns,
 		Duration:        time.Since(start),
-	}, !dryRun && len(updateSpecs) > 0)
+	}
+
+	if jsonMode() {
+		command := "update"
+		if dryRun {
+			command = "check"
+		}
+		return printReport(buildReport(
+			command, f.file, res, out.Versions, out.Err,
+		))
+	}
+
+	PrintVulnerabilities(out.Vulns)
+	PrintUpdates(updates)
+	PrintSkipped(updates)
+	PrintSummary(res, updated)
 
 	return nil
 }
@@ -379,28 +401,32 @@ func runScan(ctx context.Context, file string) error {
 		return err
 	}
 
-	spin := ui.NewSpinner(fmt.Sprintf(
+	stopSpinner := startSpinner(fmt.Sprintf(
 		"Scanning %d dependencies for vulnerabilities...",
 		len(target.Deps),
 	))
-	spin.Start()
-
 	out := collectScan(ctx, target)
+	stopSpinner()
 
-	spin.Stop()
+	res := types.ScanResult{
+		Vulnerabilities: out.Vulns,
+		TotalPackages:   len(target.Deps),
+		TotalVulns:      countVulns(out.Vulns),
+		VulnsScanned:    true,
+		Duration:        time.Since(start),
+	}
+
+	if jsonMode() {
+		return printReport(buildReport(
+			"scan", file, res, out.Versions, out.Err,
+		))
+	}
 
 	if out.Err != nil {
 		PrintError(out.Err.Error())
 	}
-
 	PrintVulnerabilities(out.Vulns)
-
-	PrintSummary(types.ScanResult{
-		TotalPackages: len(target.Deps),
-		TotalVulns:    countVulns(out.Vulns),
-		VulnsScanned:  true,
-		Duration:      time.Since(start),
-	}, false)
+	PrintSummary(res, false)
 
 	return nil
 }

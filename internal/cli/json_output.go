@@ -5,7 +5,10 @@ Machine-readable output for --json and --json-compact (Desafio 3)
 
 With either flag set, stdout carries only JSON: no banner, no spinner,
 no colors. That keeps `angela scan --json | jq` working. Errors are
-printed as {"error": "..."} and the process exits with code 1.
+printed as {"error": "..."} and the process exits with code 1. If
+OSV.dev fails, the report is still printed (vulnerabilities_scanned is
+false, the cause is in "errors") and the exit code is also 1, so a CI
+step never mistakes a failed query for a clean scan.
 
 Key exports (package-internal):
   jsonMode     - reports whether --json or --json-compact was given
@@ -22,6 +25,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -39,8 +43,23 @@ var (
 	stdout io.Writer = os.Stdout
 )
 
+// errAlreadyReported makes the process exit 1 without printing again,
+// because the failure is already inside the JSON that was printed
+var errAlreadyReported = errors.New("already reported")
+
 func jsonMode() bool {
 	return jsonOutput || jsonCompact
+}
+
+// argsWantJSON catches --json when cobra failed before setting the flag
+// (unknown flag, bad value), so the error still comes out as JSON
+func argsWantJSON(args []string) bool {
+	for _, a := range args {
+		if a == "--json" || a == "--json-compact" {
+			return true
+		}
+	}
+	return false
 }
 
 func addJSONFlags(cmd *cobra.Command) {
@@ -52,6 +71,7 @@ func addJSONFlags(cmd *cobra.Command) {
 		&jsonCompact, "json-compact", false,
 		"print results as single-line JSON (for log aggregation)",
 	)
+	cmd.MarkFlagsMutuallyExclusive("json", "json-compact")
 }
 
 // startSpinner returns the function that stops it
@@ -81,10 +101,22 @@ func printReport(report types.Report) error {
 	return err
 }
 
+// printReportFailingOn prints the report and, when scanErr is set, exits 1
+// so a CI step cannot mistake a failed OSV query for a clean scan
+func printReportFailingOn(report types.Report, scanErr error) error {
+	if err := printReport(report); err != nil {
+		return err
+	}
+	if scanErr != nil {
+		return errAlreadyReported
+	}
+	return nil
+}
+
 func printJSONError(msg string) {
 	data, err := json.Marshal(map[string]string{"error": msg})
 	if err != nil {
 		return
 	}
-	_, _ = fmt.Fprintln(stdout, string(data)) //nolint:errcheck
+	_, _ = fmt.Fprintln(stdout, string(data)) //nolint:errcheck // nothing left to report to
 }

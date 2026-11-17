@@ -146,6 +146,11 @@ func buildReport(
 			[]types.Vulnerability(nil), res.Vulnerabilities[pkg]...,
 		)
 		sortVulnsBySeverity(vlist)
+		for i := range vlist {
+			if vlist[i].Aliases == nil {
+				vlist[i].Aliases = []string{}
+			}
+		}
 		report.Vulnerabilities = append(
 			report.Vulnerabilities,
 			types.PackageVulns{

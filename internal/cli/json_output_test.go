@@ -6,7 +6,10 @@ End-to-end tests of `angela scan --json` with a fake OSV scan (no network)
 Tests:
   TestScanJSON         - stdout is only JSON, parsed back into types.Report
   TestScanJSONCompact  - --json-compact prints exactly one line
-  TestScanJSONOSVError - an OSV failure lands in "errors", vulnerabilities is []
+  TestScanJSONOSVError - an OSV failure lands in "errors", vulnerabilities_scanned
+                         is false, vulnerabilities is [], and the run fails
+  TestJSONFlagsExclusive - --json and --json-compact together are rejected
+  TestArgsWantJSON     - detects --json even when cobra never parsed it
 */
 
 package cli
@@ -28,7 +31,7 @@ func runCLI(
 	t *testing.T,
 	fake func(context.Context, []types.Dependency) (map[string][]types.Vulnerability, error),
 	args ...string,
-) string {
+) (string, error) {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "requirements.txt")
@@ -44,10 +47,8 @@ func runCLI(
 
 	root := newRootCmd()
 	root.SetArgs(append([]string{"scan", "--file", path}, args...))
-	if err := root.Execute(); err != nil {
-		t.Fatal(err)
-	}
-	return buf.String()
+	err := root.Execute()
+	return buf.String(), err
 }
 
 func fakeVulns(
@@ -63,7 +64,10 @@ func fakeVulns(
 }
 
 func TestScanJSON(t *testing.T) {
-	out := runCLI(t, fakeVulns, "--json")
+	out, err := runCLI(t, fakeVulns, "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if !strings.HasPrefix(out, "{") {
 		t.Fatalf("stdout must start with JSON, got %q", out[:min(40, len(out))])
@@ -85,10 +89,16 @@ func TestScanJSON(t *testing.T) {
 	if r.Vulnerabilities[0].Vulnerabilities[0].ID != "GHSA-d2" {
 		t.Error("CRITICAL should come first")
 	}
+	if strings.Contains(out, `"aliases": null`) {
+		t.Error("aliases must be [] not null")
+	}
 }
 
 func TestScanJSONCompact(t *testing.T) {
-	out := runCLI(t, fakeVulns, "--json-compact")
+	out, err := runCLI(t, fakeVulns, "--json-compact")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if lines := strings.Count(strings.TrimSpace(out), "\n"); lines != 0 {
 		t.Errorf("compact output has %d line breaks", lines)
@@ -105,7 +115,10 @@ func TestScanJSONOSVError(t *testing.T) {
 		return nil, errors.New("osv unavailable")
 	}
 
-	out := runCLI(t, failing, "--json")
+	out, err := runCLI(t, failing, "--json")
+	if !errors.Is(err, errAlreadyReported) {
+		t.Errorf("err = %v, want errAlreadyReported (exit 1)", err)
+	}
 
 	var r types.Report
 	if err := json.Unmarshal([]byte(out), &r); err != nil {
@@ -116,5 +129,26 @@ func TestScanJSONOSVError(t *testing.T) {
 	}
 	if !strings.Contains(out, `"vulnerabilities": []`) {
 		t.Errorf("vulnerabilities must be []: %s", out)
+	}
+	if r.Summary.VulnsScanned {
+		t.Error("vulnerabilities_scanned must be false when OSV failed")
+	}
+}
+
+func TestJSONFlagsExclusive(t *testing.T) {
+	_, err := runCLI(t, fakeVulns, "--json", "--json-compact")
+	if err == nil {
+		t.Error("expected an error for --json with --json-compact")
+	}
+}
+
+func TestArgsWantJSON(t *testing.T) {
+	t.Parallel()
+
+	if !argsWantJSON([]string{"scan", "--bogus", "--json"}) {
+		t.Error("should detect --json")
+	}
+	if argsWantJSON([]string{"scan", "--file", "x.txt"}) {
+		t.Error("no JSON flag given")
 	}
 }

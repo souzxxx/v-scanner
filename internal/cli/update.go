@@ -30,6 +30,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -69,9 +70,11 @@ func defaultCacheDir() string {
 // Execute sets up the CLI and runs the root command
 func Execute() {
 	if err := newRootCmd().Execute(); err != nil {
-		if jsonMode() {
+		switch {
+		case errors.Is(err, errAlreadyReported):
+		case jsonMode() || argsWantJSON(os.Args[1:]):
 			printJSONError(err.Error())
-		} else {
+		default:
 			PrintError(err.Error())
 		}
 		os.Exit(1)
@@ -332,10 +335,13 @@ func runUpdate(
 	fetched := client.FetchAllVersions(ctx, names)
 
 	versionMap := make(map[string][]string, len(fetched))
+	var fetchErrs []error
 	for _, r := range fetched {
-		if r.Err == nil {
-			versionMap[r.Name] = r.Versions
+		if r.Err != nil {
+			fetchErrs = append(fetchErrs, r.Err)
+			continue
 		}
+		versionMap[r.Name] = r.Versions
 	}
 
 	updates, updateSpecs := resolveUpdates(
@@ -371,7 +377,7 @@ func runUpdate(
 		TotalPackages:   len(deps),
 		TotalUpdated:    len(updateSpecs),
 		TotalVulns:      countVulns(out.Vulns),
-		VulnsScanned:    f.vulns,
+		VulnsScanned:    f.vulns && out.Err == nil,
 		Duration:        time.Since(start),
 	}
 
@@ -380,9 +386,13 @@ func runUpdate(
 		if dryRun {
 			command = "check"
 		}
-		return printReport(buildReport(
-			command, f.file, res, out.Versions, out.Err,
-		))
+		return printReportFailingOn(
+			buildReport(
+				command, f.file, res, out.Versions,
+				append(fetchErrs, out.Err)...,
+			),
+			out.Err,
+		)
 	}
 
 	PrintVulnerabilities(out.Vulns)
@@ -412,14 +422,15 @@ func runScan(ctx context.Context, file string) error {
 		Vulnerabilities: out.Vulns,
 		TotalPackages:   len(target.Deps),
 		TotalVulns:      countVulns(out.Vulns),
-		VulnsScanned:    true,
+		VulnsScanned:    out.Err == nil,
 		Duration:        time.Since(start),
 	}
 
 	if jsonMode() {
-		return printReport(buildReport(
-			"scan", file, res, out.Versions, out.Err,
-		))
+		return printReportFailingOn(
+			buildReport("scan", file, res, out.Versions, out.Err),
+			out.Err,
+		)
 	}
 
 	if out.Err != nil {

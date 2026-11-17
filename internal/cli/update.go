@@ -15,7 +15,7 @@ Key exports:
 
 Connects to:
   main.go                - Execute called from main
-  config.go              - calls Load before each run
+  scan_core.go           - loadScanTarget and collectScan (config, parse, OSV, filters)
   pypi/client.go         - creates Client and calls FetchAllVersions
   osv/client.go          - calls NewClient and ScanPackages
   pyproject/parser.go    - calls ParseFile and ExtractMinVersion
@@ -37,7 +37,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/CarterPerez-dev/angela/internal/config"
 	"github.com/CarterPerez-dev/angela/internal/osv"
 	"github.com/CarterPerez-dev/angela/internal/pypi"
 	"github.com/CarterPerez-dev/angela/internal/pyproject"
@@ -297,12 +296,12 @@ func runUpdate(
 	dryRun bool,
 ) error {
 	start := time.Now()
-	cfg := config.Load(f.file)
 
-	deps, err := parseDeps(f.file)
+	target, err := loadScanTarget(f.file)
 	if err != nil {
 		return err
 	}
+	cfg, deps := target.Cfg, target.Deps
 
 	spin := ui.NewSpinner(fmt.Sprintf(
 		"Scanning %d dependencies...", len(deps),
@@ -335,16 +334,15 @@ func runUpdate(
 
 	sortUpdates(updates)
 
-	var vulns map[string][]types.Vulnerability
-	var scanErr error
+	var out scanOutcome
 	if f.vulns {
-		vulns, scanErr = scanForVulns(ctx, deps)
+		out = collectScan(ctx, target)
 	}
 
 	spin.Stop()
 
-	if scanErr != nil {
-		PrintError(scanErr.Error())
+	if out.Err != nil {
+		PrintError(out.Err.Error())
 	}
 
 	if !dryRun && len(updateSpecs) > 0 {
@@ -355,27 +353,17 @@ func runUpdate(
 		}
 	}
 
-	minSev := resolveMinSeverity(cfg.MinSeverity)
-	if vulns != nil {
-		vulns = filterIgnoredVulns(vulns, cfg.IgnoreVulns)
-		vulns = filterVulnsBySeverity(vulns, minSev)
-		PrintVulnerabilities(vulns)
-	}
+	PrintVulnerabilities(out.Vulns)
 
 	PrintUpdates(updates)
 	PrintSkipped(updates)
 
-	totalVulns := 0
-	for _, vl := range vulns {
-		totalVulns += len(vl)
-	}
-
 	PrintSummary(types.ScanResult{
 		Updates:         updates,
-		Vulnerabilities: vulns,
+		Vulnerabilities: out.Vulns,
 		TotalPackages:   len(deps),
 		TotalUpdated:    len(updateSpecs),
-		TotalVulns:      totalVulns,
+		TotalVulns:      countVulns(out.Vulns),
 		VulnsScanned:    f.vulns,
 		Duration:        time.Since(start),
 	}, !dryRun && len(updateSpecs) > 0)
@@ -385,40 +373,31 @@ func runUpdate(
 
 func runScan(ctx context.Context, file string) error {
 	start := time.Now()
-	cfg := config.Load(file)
 
-	deps, err := parseDeps(file)
+	target, err := loadScanTarget(file)
 	if err != nil {
 		return err
 	}
 
 	spin := ui.NewSpinner(fmt.Sprintf(
 		"Scanning %d dependencies for vulnerabilities...",
-		len(deps),
+		len(target.Deps),
 	))
 	spin.Start()
 
-	minSev := resolveMinSeverity(cfg.MinSeverity)
-	vulns, scanErr := scanForVulns(ctx, deps)
+	out := collectScan(ctx, target)
 
 	spin.Stop()
 
-	if scanErr != nil {
-		PrintError(scanErr.Error())
+	if out.Err != nil {
+		PrintError(out.Err.Error())
 	}
 
-	vulns = filterIgnoredVulns(vulns, cfg.IgnoreVulns)
-	vulns = filterVulnsBySeverity(vulns, minSev)
-	PrintVulnerabilities(vulns)
-
-	totalVulns := 0
-	for _, vl := range vulns {
-		totalVulns += len(vl)
-	}
+	PrintVulnerabilities(out.Vulns)
 
 	PrintSummary(types.ScanResult{
-		TotalPackages: len(deps),
-		TotalVulns:    totalVulns,
+		TotalPackages: len(target.Deps),
+		TotalVulns:    countVulns(out.Vulns),
 		VulnsScanned:  true,
 		Duration:      time.Since(start),
 	}, false)

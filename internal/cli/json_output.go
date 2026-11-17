@@ -118,5 +118,5 @@ func printJSONError(msg string) {
 	if err != nil {
 		return
 	}
-	_, _ = fmt.Fprintln(stdout, string(data)) //nolint:errcheck // nothing left to report to
+	_, _ = fmt.Fprintln(stdout, string(data)) //nolint:errcheck
 }

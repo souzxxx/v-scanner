@@ -6,13 +6,16 @@ Tests for `angela monitor` with a fake scan (no network)
 Tests:
   TestMonitorAlertsOnlyOnce        - baseline, then a new CVE alerts once
   TestMonitorVersionBumpResolves   - bumping the pinned version resolves alerts
+  TestMonitorBumpStillAffected     - same advisory on the new version is not NEW
+  TestViewOfPairsBumps             - viewOf pairs RESOLVED+NEW of one advisory
   TestMonitorScanErrorKeepsState   - a failed scan never touches the state
   TestMonitorRestartNoRepeat       - a new session over the same state is quiet
-  TestMonitorRunOnce               - --once runs one round; a failure exits 1
+  TestMonitorRunOnce               - --once runs one round; failure or Ctrl+C exits 1
   TestMonitorRunStopsOnCancel      - Ctrl+C ends the loop and saves the state
   TestMonitorJSONLines             - --json prints one valid JSON per round
   TestMonitorLogFile               - the log gets one line per alert
-  TestIsPinned                     - only == / === specs count as pinned
+  TestIsPinned                     - only exact == specs count as pinned
+  TestPinWarning                   - the warning names the actual problem
   TestDefaultStatePath             - one stable state file per dependency file
   TestShortDuration                - 1h instead of 1h0m0s
   TestExpandHome                   - ~/ in flag values points at the home dir
@@ -179,6 +182,56 @@ func TestMonitorVersionBumpResolves(t *testing.T) {
 	}
 }
 
+func TestMonitorBumpStillAffected(t *testing.T) {
+	fixedNow(t)
+	tl := newTestLoop(t, statePath(t),
+		ok(snapOf("3.2.0", vulnA, vulnB)),
+		ok(snapOf("3.2.1", vulnA)),
+	)
+
+	tl.step(t)
+	out := tl.step(t)
+	if strings.Contains(out, "NEW") {
+		t.Errorf("advisory that followed the bump raised NEW:\n%s", out)
+	}
+	if !strings.Contains(
+		out,
+		"django 3.2.0 → 3.2.1: 1 advisory still applies",
+	) {
+		t.Errorf("missing bump line:\n%s", out)
+	}
+	if !strings.Contains(out, "RESOLVED") ||
+		!strings.Contains(out, "GHSA-bbbb") ||
+		strings.Count(out, "RESOLVED") != 1 {
+		t.Errorf("only GHSA-bbbb should be resolved:\n%s", out)
+	}
+}
+
+func TestViewOfPairsBumps(t *testing.T) {
+	t.Parallel()
+
+	d := monitor.Diff{
+		New: []monitor.Finding{
+			{Package: "Django", Version: "3.2.1", Vuln: vulnA},
+			{Package: "django", Version: "3.2.1", Vuln: vulnB},
+		},
+		Resolved: []monitor.Finding{
+			{Package: "django", Version: "3.2.0", Vuln: vulnA},
+		},
+	}
+	v := viewOf(d)
+	if len(v.Still) != 1 || v.Still[0].FromVersion != "3.2.0" ||
+		v.Still[0].Vuln.ID != "GHSA-aaaa" {
+		t.Errorf("still = %+v", v.Still)
+	}
+	if len(v.New) != 1 || v.New[0].Vuln.ID != "GHSA-bbbb" {
+		t.Errorf("new = %+v", v.New)
+	}
+	if len(v.Resolved) != 0 {
+		t.Errorf("resolved = %+v", v.Resolved)
+	}
+}
+
 func TestMonitorScanErrorKeepsState(t *testing.T) {
 	fixedNow(t)
 	path := statePath(t)
@@ -247,6 +300,16 @@ func TestMonitorRunOnce(t *testing.T) {
 	err := bad.run(context.Background(), time.Hour, true)
 	if !errors.Is(err, errAlreadyReported) {
 		t.Errorf("failed --once should exit 1, got %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cut := newTestLoop(t, statePath(t), func() (monitor.Snapshot, error) {
+		cancel() // SIGTERM from a CI timeout in the middle of the scan
+		return monitor.Snapshot{}, context.Canceled
+	})
+	if err := cut.run(ctx, time.Hour, true); !errors.Is(err, errInterrupted) {
+		t.Errorf("interrupted --once should exit 1, got %v", err)
 	}
 }
 
@@ -332,11 +395,11 @@ func TestMonitorLogFile(t *testing.T) {
 	}
 
 	want := []string{
-		"2026-11-19T12:00:00Z BASELINE file=req.txt known=1",
-		"2026-11-19T12:00:00Z NEW django 3.2.0 GHSA-bbbb CRITICAL",
+		"2026-11-19T12:00:00Z BASELINE known=1 file=req.txt",
+		"2026-11-19T12:00:00Z NEW django 3.2.0 GHSA-bbbb CRITICAL file=req.txt",
 		// most severe first: GHSA-bbbb is CRITICAL, GHSA-aaaa is HIGH
-		"2026-11-19T12:00:00Z RESOLVED django 3.2.0 GHSA-bbbb",
-		"2026-11-19T12:00:00Z RESOLVED django 3.2.0 GHSA-aaaa",
+		"2026-11-19T12:00:00Z RESOLVED django 3.2.0 GHSA-bbbb file=req.txt",
+		"2026-11-19T12:00:00Z RESOLVED django 3.2.0 GHSA-aaaa file=req.txt",
 	}
 	got := strings.Split(strings.TrimSpace(tl.log.String()), "\n")
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
@@ -350,7 +413,7 @@ func TestIsPinned(t *testing.T) {
 
 	cases := map[string]bool{
 		"==3.2.0":       true,
-		"===3.2.0":      true,
+		"===3.2.0":      false,
 		">=3.2.0":       false,
 		"==3.2.*":       false,
 		"==3.2.0,<4":    false,
@@ -361,6 +424,24 @@ func TestIsPinned(t *testing.T) {
 	for spec, want := range cases {
 		if got := isPinned(spec); got != want {
 			t.Errorf("isPinned(%q) = %v, want %v", spec, got, want)
+		}
+	}
+}
+
+func TestPinWarning(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]string{
+		"==3.2.0":  "",
+		"":         "has no version",
+		">=3.2":    "checks 3.2 only",
+		"<4.0":     "has no == or >= version",
+		"===3.2.0": "uses ===",
+	}
+	for spec, want := range cases {
+		got := pinWarning(types.Dependency{Name: "django", Spec: spec})
+		if (want == "") != (got == "") || !strings.Contains(got, want) {
+			t.Errorf("pinWarning(%q) = %q, want ~%q", spec, got, want)
 		}
 	}
 }

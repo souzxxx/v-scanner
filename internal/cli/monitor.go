@@ -32,6 +32,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -63,6 +64,12 @@ type monitorFlags struct {
 	once     bool
 }
 
+// errInterrupted ends a --once run cut short by Ctrl+C or SIGTERM with
+// exit code 1, so CI never reads a cancelled scan as a clean one
+var errInterrupted = errors.New(
+	"interrupted before the scan finished; state unchanged",
+)
+
 // monitorScanFunc runs one scan round; tests replace it with a fake
 type monitorScanFunc func(ctx context.Context) (monitor.Snapshot, error)
 
@@ -89,10 +96,15 @@ func angelaHome() string {
 // expandHome turns a leading ~/ into the home directory, so flag
 // defaults read the same on every machine
 func expandHome(path string) string {
-	if rest, ok := strings.CutPrefix(path, "~/"); ok {
-		return filepath.Join(filepath.Dir(angelaHome()), rest)
+	rest, ok := strings.CutPrefix(path, "~/")
+	if !ok {
+		return path
 	}
-	return path
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	return filepath.Join(home, rest)
 }
 
 // shortDuration prints 1h instead of 1h0m0s
@@ -206,7 +218,7 @@ func runMonitor(ctx context.Context, f *monitorFlags) error {
 	m := &monitorLoop{
 		state:     state,
 		statePath: statePath,
-		file:      f.file,
+		file:      absFile,
 		out:       stdout,
 		log:       logW,
 		json:      jsonMode(),
@@ -269,22 +281,34 @@ func newMonitorScan(
 	}
 }
 
-// isPinned reports whether spec names exactly one version (== or ===)
+// isPinned reports whether spec names exactly one version with ==.
+// === is left out: the scan pipeline cannot read it as a version.
 func isPinned(spec string) bool {
 	s := strings.TrimSpace(spec)
-	if !strings.HasPrefix(s, "==") {
+	if !strings.HasPrefix(s, "==") || strings.HasPrefix(s, "===") {
 		return false
 	}
-	return !strings.ContainsAny(strings.TrimLeft(s, "="), ",*")
+	return !strings.ContainsAny(s[2:], ",*")
 }
 
 func pinWarning(d types.Dependency) string {
 	if isPinned(d.Spec) {
 		return ""
 	}
-	if pyproject.ExtractMinVersion(d.Spec) == "" {
+	switch {
+	case strings.TrimSpace(d.Spec) == "":
 		return fmt.Sprintf(
 			"%s has no version and is not monitored", d.Name,
+		)
+	case strings.HasPrefix(strings.TrimSpace(d.Spec), "==="):
+		return fmt.Sprintf(
+			"%s%s uses ===, which is not supported; pin it with ==",
+			d.Name, d.Spec,
+		)
+	case pyproject.ExtractMinVersion(d.Spec) == "":
+		return fmt.Sprintf(
+			"%s%s has no == or >= version and is not monitored",
+			d.Name, d.Spec,
 		)
 	}
 	return fmt.Sprintf(
@@ -319,7 +343,10 @@ func (m *monitorLoop) run(
 			return err
 		}
 		if once {
-			if scanErr != nil {
+			switch {
+			case errors.Is(scanErr, errInterrupted):
+				return scanErr
+			case scanErr != nil:
 				return errAlreadyReported
 			}
 			return nil
@@ -342,8 +369,8 @@ func (m *monitorLoop) run(
 // be saved)
 func (m *monitorLoop) round(ctx context.Context) (scanErr, err error) {
 	snap, scanErr := m.scan(ctx)
-	if interrupted := scanErr != nil && ctx.Err() != nil; interrupted {
-		return nil, nil // cancelled by Ctrl+C, not a failure
+	if scanErr != nil && ctx.Err() != nil {
+		return errInterrupted, nil // Ctrl+C, not an OSV failure
 	}
 	if scanErr != nil {
 		m.reportError(scanErr)
@@ -353,7 +380,7 @@ func (m *monitorLoop) round(ctx context.Context) (scanErr, err error) {
 	diff := monitor.Compare(m.state, snap)
 	sortFindings(diff.New)
 	sortFindings(diff.Resolved)
-	m.report(snap, diff)
+	m.report(snap, viewOf(diff))
 
 	m.state.Apply(snap, diff)
 	if err := m.state.Save(m.statePath); err != nil {
@@ -399,8 +426,9 @@ func (m *monitorLoop) printf(format string, a ...any) {
 }
 
 func (m *monitorLoop) logf(format string, a ...any) {
+	// file= on every line: several monitors may share one log
 	line := now().UTC().Format(time.RFC3339) + " " +
-		fmt.Sprintf(format, a...) + "\n"
+		fmt.Sprintf(format, a...) + " file=" + m.file + "\n"
 	_, _ = io.WriteString(m.log, line) //nolint:errcheck
 }
 
@@ -420,7 +448,7 @@ func (m *monitorLoop) reportError(err error) {
 	if m.json {
 		m.emitJSON(
 			monitor.Snapshot{ScannedAt: now().UTC()},
-			monitor.Diff{},
+			roundView{},
 			err,
 		)
 		return

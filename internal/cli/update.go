@@ -61,11 +61,7 @@ type updateFlags struct {
 }
 
 func defaultCacheDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = "."
-	}
-	return filepath.Join(home, ".angela", "cache")
+	return filepath.Join(angelaHome(), "cache")
 }
 
 // Execute sets up the CLI and runs the root command

@@ -23,6 +23,7 @@ Connects to:
   pyproject/writer.go    - calls UpdateFile after resolving new versions
   requirements/writer.go - calls UpdateFile when the target file ends in .txt
   output.go              - calls all Print functions to render results
+  monitor.go             - newMonitorCmd registered on the root command
   ui                     - uses PrintBanner and NewSpinner
 */
 
@@ -60,11 +61,7 @@ type updateFlags struct {
 }
 
 func defaultCacheDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = "."
-	}
-	return filepath.Join(home, ".angela", "cache")
+	return filepath.Join(angelaHome(), "cache")
 }
 
 // Execute sets up the CLI and runs the root command
@@ -125,6 +122,7 @@ latest stable versions, and checks for known CVEs using OSV.dev.`,
 		newCheckCmd(),
 		newScanCmd(),
 		newCacheCmd(),
+		newMonitorCmd(),
 	)
 	return root
 }

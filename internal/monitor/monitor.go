@@ -1,15 +1,10 @@
 /*
-provisorio.go
+monitor.go
 
-TEMPORARY stand-in for the monitor core (card AR1, Arthur).
+Monitor core (AR1): compares scan snapshots, deduplicates findings,
+and persists state between rounds and restarts.
 
-It implements just enough of the API agreed in the AR1 card so the
-`angela monitor` command (card LN3) compiles and can be tested before
-AR1 is merged. When AR1's internal/monitor/monitor.go lands on main,
-DELETE THIS FILE: the declarations will collide on purpose, so the build
-breaks until it is removed and the real implementation is used.
-
-Agreed API (keep in sync with the AR1 card):
+API:
   Snapshot, Finding, Diff, State
   Key, LoadState, (*State).Save, Compare, (*State).Apply
 */
@@ -117,12 +112,18 @@ func (s *State) Save(path string) error {
 }
 
 func findings(cur Snapshot) map[string]Finding {
+	versions := make(map[string]string, len(cur.Versions))
+	for pkg, version := range cur.Versions {
+		versions[pypi.NormalizeName(pkg)] = version
+	}
+
 	out := map[string]Finding{}
 	for pkg, vulns := range cur.Vulns {
-		ver := cur.Versions[pkg]
+		name := pypi.NormalizeName(pkg)
+		ver := versions[name]
 		for _, v := range vulns {
-			out[Key(pkg, ver, v.ID)] = Finding{
-				Package: pkg,
+			out[Key(name, ver, v.ID)] = Finding{
+				Package: name,
 				Version: ver,
 				Vuln:    v,
 			}
